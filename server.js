@@ -44,6 +44,15 @@ app.use(
 
 const ACCENTS = ['green', 'orange', 'pink', 'blue'];
 const str = (v, max) => String(v ?? '').trim().slice(0, max);
+const HEX = /^#[0-9a-fA-F]{6}$/;
+const color = (v) => (HEX.test(String(v ?? '').trim()) ? String(v).trim() : '');
+const TYPES = ['image', 'video', 'youtube'];
+const YOUTUBE = /^https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{11})/;
+function detectType(url) {
+  if (YOUTUBE.test(url)) return 'youtube';
+  if (/\.(mp4|webm|mov|m4v|ogv)(\?|#|$)/i.test(url)) return 'video';
+  return 'image';
+}
 
 function cleanUrl(u) {
   try {
@@ -62,6 +71,9 @@ function albumFields(body, { partial }) {
   if ('accent' in body && ACCENTS.includes(body.accent)) out.accent = body.accent;
   if ('cover' in body) out.cover = body.cover ? cleanUrl(body.cover) || '' : '';
   if ('order' in body && Number.isFinite(Number(body.order))) out.order = Number(body.order);
+  for (const k of ['frameColor', 'numberColor', 'buttonColor', 'hoverColor']) {
+    if (k in body) out[k] = color(body[k]);
+  }
   return out;
 }
 
@@ -155,11 +167,18 @@ app.post(
     if (!album) return;
     const list = Array.isArray(req.body?.photos) ? req.body.photos : [];
     const photos = list
-      .map((p) => ({ url: cleanUrl(p?.url), caption: str(p?.caption, 200) }))
-      .filter((p) => p.url);
+      .map((p) => {
+        const url = cleanUrl(p?.url);
+        if (!url) return null;
+        return { url, type: TYPES.includes(p?.type) ? p.type : detectType(url), caption: str(p?.caption, 200) };
+      })
+      .filter(Boolean);
     if (photos.length === 0) return res.status(400).json({ error: 'Aucune URL valide (http/https)' });
     album.photos.push(...photos.slice(0, 50));
-    if (!album.cover) album.cover = album.photos[0].url;
+    if (!album.cover) {
+      const firstImage = album.photos.find((p) => p.type === 'image');
+      if (firstImage) album.cover = firstImage.url;
+    }
     res.json(await album.save());
   }),
 );
@@ -192,6 +211,7 @@ app.put(
       if (!url) return res.status(400).json({ error: 'URL invalide' });
       if (album.cover === photo.url) album.cover = url;
       photo.url = url;
+      photo.type = detectType(url);
     }
     if ('caption' in req.body) photo.caption = str(req.body.caption, 200);
     res.json(await album.save());
@@ -223,10 +243,14 @@ const s3 = r2Ready
     })
   : null;
 
-const EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif' };
+const EXT = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif',
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
+};
+const MAX_IMAGE = 20 * 1024 * 1024;
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => cb(null, file.mimetype in EXT),
 });
 
@@ -238,12 +262,18 @@ app.post(
     if (!s3) {
       return res.status(501).json({ error: "Upload R2 non configuré : ajoute les photos par URL, ou renseigne les variables R2_*." });
     }
-    if (!req.file) return res.status(400).json({ error: 'Fichier image invalide (jpg, png, webp, gif, avif — 20 Mo max)' });
+    if (!req.file) {
+      return res.status(400).json({ error: 'Fichier invalide (images jpg/png/webp/gif/avif, vidéos mp4/webm/mov — 100 Mo max)' });
+    }
+    const isVideo = req.file.mimetype.startsWith('video/');
+    if (!isVideo && req.file.size > MAX_IMAGE) {
+      return res.status(400).json({ error: 'Image trop lourde (20 Mo max)' });
+    }
     const key = `albums/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${EXT[req.file.mimetype]}`;
     await s3.send(
       new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: req.file.buffer, ContentType: req.file.mimetype }),
     );
-    res.json({ url: `${R2_PUBLIC_URL.replace(/\/$/, '')}/${key}` });
+    res.json({ url: `${R2_PUBLIC_URL.replace(/\/$/, '')}/${key}`, type: isVideo ? 'video' : 'image' });
   }),
 );
 
