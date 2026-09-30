@@ -8,6 +8,8 @@ import multer from 'multer';
 import rateLimit from 'express-rate-limit';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Album from './models/Album.js';
+import Setting from './models/Setting.js';
+import Message from './models/Message.js';
 
 const {
   PORT = 5000,
@@ -20,6 +22,9 @@ const {
   R2_SECRET_ACCESS_KEY,
   R2_BUCKET,
   R2_PUBLIC_URL,
+  RESEND_API_KEY,
+  RESEND_FROM,
+  CONTACT_TO,
 } = process.env;
 
 for (const [k, v] of Object.entries({ MONGODB_URI, ADMIN_PASSWORD, JWT_SECRET })) {
@@ -44,6 +49,11 @@ app.use(
 
 const ACCENTS = ['green', 'orange', 'pink', 'blue'];
 const str = (v, max) => String(v ?? '').trim().slice(0, max);
+const isEmail = (v) => {
+  const e = String(v ?? '').trim();
+  return e.length <= 120 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
+};
+const urlOrEmpty = (u) => (u ? cleanUrl(u) || '' : '');
 const HEX = /^#[0-9a-fA-F]{6}$/;
 const color = (v) => (HEX.test(String(v ?? '').trim()) ? String(v).trim() : '');
 const TYPES = ['image', 'video', 'youtube'];
@@ -229,6 +239,133 @@ app.delete(
     if (album.cover === photo.url) album.cover = '';
     album.photos.pull(req.params.photoId);
     res.json(await album.save());
+  }),
+);
+
+/* ------------------------- Réglages du site ------------------------- */
+
+function cleanSettings(b = {}) {
+  const hero = b.hero || {};
+  const about = b.about || {};
+  const marquee = b.marquee || {};
+  const contact = b.contact || {};
+  const list = (arr, max) => (Array.isArray(arr) ? arr.map(urlOrEmpty).filter(Boolean).slice(0, max) : []);
+  return {
+    hero: { base: urlOrEmpty(hero.base), reveal: urlOrEmpty(hero.reveal) },
+    about: {
+      image: urlOrEmpty(about.image),
+      heading: str(about.heading, 300),
+      paragraph: str(about.paragraph, 2000),
+      touring: str(about.touring, 200),
+      stats: (Array.isArray(about.stats) ? about.stats : [])
+        .slice(0, 8)
+        .map((x) => ({
+          value: str(x?.value, 12),
+          label: str(x?.label, 30),
+          color: ACCENTS.includes(x?.color) ? x.color : 'green',
+        }))
+        .filter((x) => x.value || x.label),
+    },
+    marquee: { label: str(marquee.label, 60), topRow: list(marquee.topRow, 40), bottomRow: list(marquee.bottomRow, 40) },
+    contact: {
+      instagram: urlOrEmpty(contact.instagram),
+      email: isEmail(contact.email) ? str(contact.email, 120) : '',
+      intro: str(contact.intro, 500),
+    },
+  };
+}
+
+app.get(
+  '/api/settings',
+  wrap(async (_req, res) => {
+    const doc = await Setting.findOne({ key: 'site' });
+    res.json(doc?.data ?? {});
+  }),
+);
+
+app.put(
+  '/api/settings',
+  requireAuth,
+  wrap(async (req, res) => {
+    const data = cleanSettings(req.body || {});
+    await Setting.findOneAndUpdate({ key: 'site' }, { data }, { upsert: true, new: true });
+    res.json(data);
+  }),
+);
+
+/* ------------------------------ Contact ------------------------------ */
+
+async function notifyByEmail({ name, email, message }) {
+  if (!RESEND_API_KEY || !CONTACT_TO) return;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: RESEND_FROM || 'swagtrickryan <onboarding@resend.dev>',
+        to: [CONTACT_TO],
+        reply_to: email,
+        subject: `Nouveau message de ${name}`,
+        text: `${name} <${email}>\n\n${message}`,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) console.error('Resend', r.status, await r.text());
+  } catch (e) {
+    console.error('Resend', e.message);
+  }
+}
+
+app.post(
+  '/api/contact',
+  rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many messages, please try again later.' },
+  }),
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    if (b.website) return res.json({ ok: true }); // champ piège pour les robots
+    const name = str(b.name, 80);
+    const email = str(b.email, 120);
+    const message = str(b.message, 3000);
+    if (!name || !isEmail(email) || message.length < 5) {
+      return res.status(400).json({ error: 'Please fill in your name, a valid email and a message.' });
+    }
+    await Message.create({ name, email, message });
+    notifyByEmail({ name, email, message }); // sans attendre : le message est déjà enregistré
+    res.status(201).json({ ok: true });
+  }),
+);
+
+app.get(
+  '/api/messages',
+  requireAuth,
+  wrap(async (_req, res) => {
+    res.json(await Message.find().sort({ createdAt: -1 }).limit(200));
+  }),
+);
+
+app.put(
+  '/api/messages/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Message introuvable' });
+    const msg = await Message.findByIdAndUpdate(req.params.id, { read: !!req.body?.read }, { new: true });
+    if (!msg) return res.status(404).json({ error: 'Message introuvable' });
+    res.json(msg);
+  }),
+);
+
+app.delete(
+  '/api/messages/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Message introuvable' });
+    await Message.findByIdAndDelete(req.params.id);
+    res.json({ ok: true });
   }),
 );
 
