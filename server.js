@@ -244,35 +244,29 @@ app.delete(
 
 /* ------------------------- Réglages du site ------------------------- */
 
+// Nettoyage générique : on garde uniquement des objets/tableaux/textes/nombres/booléens de taille raisonnable
+function cleanValue(v, depth = 0) {
+  if (depth > 8) return undefined;
+  if (typeof v === 'string') return v.slice(0, 5000);
+  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined;
+  if (typeof v === 'boolean') return v;
+  if (Array.isArray(v)) return v.slice(0, 200).map((x) => cleanValue(x, depth + 1)).filter((x) => x !== undefined);
+  if (v && typeof v === 'object') {
+    const out = {};
+    for (const [k, val] of Object.entries(v).slice(0, 120)) {
+      if (!/^[\w-]{1,40}$/.test(k) || k === '__proto__') continue;
+      const c = cleanValue(val, depth + 1);
+      if (c !== undefined) out[k] = c;
+    }
+    return out;
+  }
+  return undefined;
+}
+
 function cleanSettings(b = {}) {
-  const hero = b.hero || {};
-  const about = b.about || {};
-  const marquee = b.marquee || {};
-  const contact = b.contact || {};
-  const list = (arr, max) => (Array.isArray(arr) ? arr.map(urlOrEmpty).filter(Boolean).slice(0, max) : []);
-  return {
-    hero: { base: urlOrEmpty(hero.base), reveal: urlOrEmpty(hero.reveal) },
-    about: {
-      image: urlOrEmpty(about.image),
-      heading: str(about.heading, 300),
-      paragraph: str(about.paragraph, 2000),
-      touring: str(about.touring, 200),
-      stats: (Array.isArray(about.stats) ? about.stats : [])
-        .slice(0, 8)
-        .map((x) => ({
-          value: str(x?.value, 12),
-          label: str(x?.label, 30),
-          color: ACCENTS.includes(x?.color) ? x.color : 'green',
-        }))
-        .filter((x) => x.value || x.label),
-    },
-    marquee: { label: str(marquee.label, 60), topRow: list(marquee.topRow, 40), bottomRow: list(marquee.bottomRow, 40) },
-    contact: {
-      instagram: urlOrEmpty(contact.instagram),
-      email: isEmail(contact.email) ? str(contact.email, 120) : '',
-      intro: str(contact.intro, 500),
-    },
-  };
+  const data = cleanValue(b) || {};
+  if (JSON.stringify(data).length > 400_000) throw new Error('Réglages trop volumineux');
+  return data;
 }
 
 app.get(
@@ -290,6 +284,102 @@ app.put(
     const data = cleanSettings(req.body || {});
     await Setting.findOneAndUpdate({ key: 'site' }, { data }, { upsert: true, new: true });
     res.json(data);
+  }),
+);
+
+/* ------------------- Reconstruction du site (GitHub Actions) ------------------- */
+
+app.post(
+  '/api/deploy',
+  requireAuth,
+  wrap(async (_req, res) => {
+    const { GITHUB_TOKEN, GITHUB_REPO } = process.env;
+    if (!GITHUB_TOKEN || !GITHUB_REPO) {
+      return res.status(501).json({
+        error: 'Reconstruction automatique non configurée : ajoute GITHUB_TOKEN et GITHUB_REPO sur Render (voir le guide). Sinon, fais un commit sur GitHub pour relancer le déploiement.',
+      });
+    }
+    const r = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/deploy.yml/dispatches`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'swagtrickryan-api',
+      },
+      body: JSON.stringify({ ref: 'main' }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (r.status !== 204) return res.status(502).json({ error: `GitHub a refusé la demande (code ${r.status}).` });
+    res.json({ ok: true });
+  }),
+);
+
+/* --------------------------- Traduction automatique --------------------------- */
+
+const LANG_CODES = ['fr', 'en', 'es', 'de', 'it', 'pt', 'nl'];
+
+function splitChunks(text, max = 450) {
+  const parts = text.split(/(?<=[.!?…])\s+|\n+/).filter(Boolean);
+  const chunks = [];
+  let cur = '';
+  for (const p of parts) {
+    if ((cur + ' ' + p).trim().length > max && cur) {
+      chunks.push(cur);
+      cur = p;
+    } else cur = (cur + ' ' + p).trim();
+  }
+  if (cur) chunks.push(cur);
+  return chunks.flatMap((c) => (c.length > max ? c.match(new RegExp(`.{1,${max}}`, 'g')) : [c]));
+}
+
+const decodeEntities = (t) =>
+  t
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+
+async function translateOne(text, from, to) {
+  if (!text.trim()) return text;
+  const out = [];
+  for (const chunk of splitChunks(text)) {
+    const url =
+      `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=${from}|${to}` +
+      (CONTACT_TO ? `&de=${encodeURIComponent(CONTACT_TO)}` : '');
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const j = await r.json();
+    if (j.responseStatus !== 200) throw new Error(j.responseDetails || 'Service de traduction indisponible');
+    out.push(decodeEntities(j.responseData.translatedText));
+  }
+  return out.join(' ');
+}
+
+app.post(
+  '/api/translate',
+  requireAuth,
+  wrap(async (req, res) => {
+    const { from, to } = req.body || {};
+    const texts = Array.isArray(req.body?.texts) ? req.body.texts.map((t) => str(t, 2000)) : [];
+    if (!LANG_CODES.includes(from) || !LANG_CODES.includes(to) || from === to) {
+      return res.status(400).json({ error: 'Langues invalides' });
+    }
+    if (texts.length === 0 || texts.length > 80 || texts.join('').length > 12000) {
+      return res.status(400).json({ error: 'Trop de texte à traduire en une fois' });
+    }
+    const out = new Array(texts.length);
+    let next = 0;
+    // 4 traductions en parallèle au maximum
+    await Promise.all(
+      Array.from({ length: 4 }, async () => {
+        while (next < texts.length) {
+          const i = next++;
+          out[i] = await translateOne(texts[i], from, to);
+        }
+      }),
+    );
+    res.json({ texts: out });
   }),
 );
 
