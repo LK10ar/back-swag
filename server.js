@@ -10,6 +10,7 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Album from './models/Album.js';
 import Setting from './models/Setting.js';
 import Message from './models/Message.js';
+import { translateText } from './translate.js';
 
 const {
   PORT = 5000,
@@ -319,50 +320,13 @@ app.post(
 
 const LANG_CODES = ['fr', 'en', 'es', 'de', 'it', 'pt', 'nl'];
 
-function splitChunks(text, max = 450) {
-  const parts = text.split(/(?<=[.!?…])\s+|\n+/).filter(Boolean);
-  const chunks = [];
-  let cur = '';
-  for (const p of parts) {
-    if ((cur + ' ' + p).trim().length > max && cur) {
-      chunks.push(cur);
-      cur = p;
-    } else cur = (cur + ' ' + p).trim();
-  }
-  if (cur) chunks.push(cur);
-  return chunks.flatMap((c) => (c.length > max ? c.match(new RegExp(`.{1,${max}}`, 'g')) : [c]));
-}
-
-const decodeEntities = (t) =>
-  t
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>');
-
-async function translateOne(text, from, to) {
-  if (!text.trim()) return text;
-  const out = [];
-  for (const chunk of splitChunks(text)) {
-    const url =
-      `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=${from}|${to}` +
-      (CONTACT_TO ? `&de=${encodeURIComponent(CONTACT_TO)}` : '');
-    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
-    const j = await r.json();
-    if (j.responseStatus !== 200) throw new Error(j.responseDetails || 'Service de traduction indisponible');
-    out.push(decodeEntities(j.responseData.translatedText));
-  }
-  return out.join(' ');
-}
-
 app.post(
   '/api/translate',
   requireAuth,
   wrap(async (req, res) => {
     const { from, to } = req.body || {};
     const texts = Array.isArray(req.body?.texts) ? req.body.texts.map((t) => str(t, 2000)) : [];
-    if (!LANG_CODES.includes(from) || !LANG_CODES.includes(to) || from === to) {
+    if (!(from === 'auto' || LANG_CODES.includes(from)) || !LANG_CODES.includes(to) || from === to) {
       return res.status(400).json({ error: 'Langues invalides' });
     }
     if (texts.length === 0 || texts.length > 80 || texts.join('').length > 12000) {
@@ -375,7 +339,7 @@ app.post(
       Array.from({ length: 4 }, async () => {
         while (next < texts.length) {
           const i = next++;
-          out[i] = await translateOne(texts[i], from, to);
+          out[i] = await translateText(texts[i], from, to, { email: CONTACT_TO });
         }
       }),
     );
