@@ -333,17 +333,23 @@ app.post(
       return res.status(400).json({ error: 'Trop de texte à traduire en une fois' });
     }
     const out = new Array(texts.length);
+    const stats = { errors: [] };
     let next = 0;
     // 4 traductions en parallèle au maximum
     await Promise.all(
       Array.from({ length: 4 }, async () => {
         while (next < texts.length) {
           const i = next++;
-          out[i] = await translateText(texts[i], from, to, { email: CONTACT_TO });
+          out[i] = await translateText(texts[i], from, to, {
+            email: CONTACT_TO,
+            deeplKey: process.env.DEEPL_API_KEY,
+            stats,
+          });
         }
       }),
     );
-    res.json({ texts: out });
+    const { errors, ...engines } = stats;
+    res.json({ texts: out, engines, errors: errors.slice(0, 4) });
   }),
 );
 
